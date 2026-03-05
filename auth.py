@@ -1,60 +1,102 @@
 import streamlit as st
+import base64
+import os
+
+
+def get_image_base64(image_path):
+    """Lit une image locale et la convertit en Base64 pour l'intégrer au HTML."""
+    if os.path.exists(image_path):
+        with open(image_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
+    return ""
 
 
 def check_password():
-    USERS = {"admin": "carrefour2026", "danone": "yaourt123"}
+    """Vérifie le mot de passe et retourne le rôle de l'utilisateur."""
 
-    if 'user_role' not in st.session_state:
-        st.session_state.user_role = None
-        st.session_state.username = None
+    # --- BASE DE DONNÉES DES COMPTES ---
+    USERS = {
+        "admin": {"pwd": "admin", "role": "ADMIN", "name": "Hub Logistique"},
+        "stefrennes": {"pwd": "carrefour123", "role": "FOURNISSEUR", "name": "STEF Rennes"},
+        "florette": {"pwd": "carrefour345", "role": "FOURNISSEUR", "name": "Florette"},
+        "fournisseur": {"pwd": "test", "role": "FOURNISSEUR", "name": "Fournisseur Test"}
+    }
 
-    with st.sidebar:
-        # Ajout du nom avec un style Premium (Dégradé, ombre subtile, police moderne)
-        st.markdown("""
-            <div style='text-align: center; margin-bottom: 25px; padding-top: 10px;'>
-                <div style='color: #94a3b8; font-size: 11px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px;'>
-                    Développé par
-                </div>
-                <div style='
-                    background: linear-gradient(90deg, #60a5fa, #3b82f6, #93c5fd);
-                    -webkit-background-clip: text;
-                    -webkit-text-fill-color: transparent;
-                    font-size: 24px; 
-                    font-weight: 800; 
-                    letter-spacing: 0.5px; 
-                    margin-top: 2px;
-                    font-family: "Inter", sans-serif;
-                    text-shadow: 0px 4px 15px rgba(59, 130, 246, 0.25);
-                '>
-                    Nouriman ALLAY
-                </div>
+    # Lecture du logo local
+    logo_b64 = get_image_base64("logo.png")
+
+    # --- GESTION DES TAILLES DU LOGO ---
+    if logo_b64:
+        # Logo de la page d'accueil (Agrandi à 140px)
+        img_html = f'<img src="data:image/png;base64,{logo_b64}" width="200" style="margin-bottom: 15px; border-radius: 8px;">'
+
+        # Logo de la barre latérale (Agrandi à 90px)
+        img_html_sidebar = f'<img src="data:image/png;base64,{logo_b64}" width="90" style="margin-bottom: 12px; border-radius: 8px;">'
+    else:
+        img_html = '<div style="color: #ef4444; font-size: 10px; margin-bottom:10px;">[Image logo.png introuvable]</div>'
+        img_html_sidebar = img_html
+
+    def login_form():
+        with st.form("Credentials"):
+
+            # --- LOGO ET NOM SUR LA PAGE DE CONNEXION ---
+            st.markdown(f"""
+            <div style="text-align: center; margin-bottom: 10px;">
+                {img_html}
+                <div style="color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;">Powered by Nouriman ALLAY</div>
+                <div style="color: #ffffff; font-weight: 700; font-size: 18px; margin-top: 2px;">Nouriman ALLAY</div>
             </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
-        # Centrage parfait du logo (Correction du warning avec use_container_width=True)
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.image("https://upload.wikimedia.org/wikipedia/fr/3/3b/Logo_Carrefour.svg", use_container_width=True)
+            st.markdown("<hr style='border-color: #262a36; margin: 15px 0 25px 0;'>", unsafe_allow_html=True)
 
-        st.markdown("<h2 style='text-align: center; color: white; margin-top: 10px; font-size: 24px;'>Connexion</h2>",
-                    unsafe_allow_html=True)
+            # --- CHAMPS DE CONNEXION ---
+            username = st.text_input("Identifiant (ex: stef rennes)").strip().lower()
+            password = st.text_input("Mot de passe", type="password")
 
-        if not st.session_state.user_role:
-            u = st.text_input("Identifiant")
-            p = st.text_input("Mot de passe", type="password")
+            submit = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
 
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("Se connecter", type="primary", use_container_width=True):
-                if u in USERS and USERS[u] == p:
-                    st.session_state.username = u
-                    st.session_state.user_role = "ADMIN" if u == "admin" else "FOURNISSEUR"
+            if submit:
+                if username in USERS and USERS[username]["pwd"] == password:
+                    st.session_state["password_correct"] = True
+                    st.session_state["username"] = USERS[username]["name"]
+                    st.session_state["role"] = USERS[username]["role"]
                     st.rerun()
                 else:
-                    st.error("Identifiants incorrects")
-            return None
-        else:
-            st.success(f"Connecté: {st.session_state.username.capitalize()}")
-            if st.button("Déconnexion", type="secondary", use_container_width=True):
-                st.session_state.user_role = None
+                    st.error("😕 Identifiant ou mot de passe incorrect")
+
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    if not st.session_state["password_correct"]:
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            st.markdown("<br><br>", unsafe_allow_html=True)
+            login_form()
+        return None
+
+    else:
+        with st.sidebar:
+
+            # --- LOGO ET NOM DANS LA BARRE LATÉRALE ---
+            st.markdown(f"""
+            <div style="text-align: center; padding: 15px 10px; margin-bottom: 25px; background-color: rgba(255,255,255,0.02); border-radius: 8px; border: 1px solid #262a36;">
+                {img_html_sidebar}
+                <div style="color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;">Gestion de Cour par</div>
+                <div style="color: #3b82f6; font-weight: 700; font-size: 14px; margin-top: 3px;">Nouriman ALLAY</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div style="background-color: rgba(59, 130, 246, 0.1); padding: 15px; border-radius: 8px; border: 1px solid rgba(59, 130, 246, 0.3); text-align: center; margin-bottom: 20px;">
+                <span class="material-symbols-outlined" style="font-size: 30px; color: #3b82f6;">account_circle</span><br>
+                <span style="color: white; font-weight: 600; font-size: 16px;">{st.session_state['username']}</span><br>
+                <span style="color: #94a3b8; font-size: 12px;">{st.session_state['role']}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if st.button("🚪 Se déconnecter", type="secondary", use_container_width=True):
+                st.session_state.clear()
                 st.rerun()
-            return st.session_state.user_role
+
+        return st.session_state["role"]
