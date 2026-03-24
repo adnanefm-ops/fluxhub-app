@@ -1,18 +1,22 @@
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
+import random
+import string
 
 DB_NAME = "supply_chain_v3.db"
 
+
 def get_connection():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
 
 def init_db():
     """Initialise la BDD et effectue les migrations automatiques."""
     conn = get_connection()
     c = conn.cursor()
 
-    # 1. Création de la table de base (avec les nouveaux champs)
+    # 1. Création de la table des livraisons
     c.execute('''
         CREATE TABLE IF NOT EXISTS livraisons (
             id TEXT PRIMARY KEY,
@@ -36,7 +40,27 @@ def init_db():
         )
     ''')
 
-    # 2. Migration automatique : on ajoute les nouveaux champs
+    # 2. Création de la table des utilisateurs
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS utilisateurs (
+            username TEXT PRIMARY KEY,
+            password TEXT,
+            role TEXT,
+            nom TEXT,
+            email TEXT,
+            statut TEXT
+        )
+    ''')
+
+    # 3. Création de l'admin par défaut si la table est vide
+    c.execute("SELECT COUNT(*) FROM utilisateurs")
+    if c.fetchone()[0] == 0:
+        c.execute(
+            "INSERT INTO utilisateurs VALUES ('admin', 'admin', 'ADMIN', 'Hub Logistique', 'nouriman_allay@carrefour.com', 'Actif')")
+        c.execute(
+            "INSERT INTO utilisateurs VALUES ('stefrennes', 'carrefour123', 'FOURNISSEUR', 'STEF Rennes', 'logistics@stef.com', 'Actif')")
+
+    # 4. Migration automatique des livraisons
     columns_to_check = {
         "est_modifie": "BOOLEAN DEFAULT 0",
         "message_sc": "TEXT",
@@ -63,11 +87,82 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 class SupplyChainDB:
     def __init__(self):
         init_db()
 
-    def create_demande(self, id_req, fourn, cat, pal, colis, date, heure, email, tel, transporteur, chauffeur, immat, comm):
+    # --- MÉTHODES UTILISATEURS ---
+    def create_user_request(self, nom_entreprise, email, password):
+        """Crée une demande de compte en attente."""
+        conn = get_connection()
+        c = conn.cursor()
+        username = nom_entreprise.lower().replace(" ", "")
+        try:
+            c.execute('''
+                INSERT INTO utilisateurs (username, password, role, nom, email, statut)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (username, password, "FOURNISSEUR", nom_entreprise, email, "En attente"))
+            conn.commit()
+            success = True
+        except sqlite3.IntegrityError:
+            success = False
+        finally:
+            conn.close()
+        return success, username
+
+    def get_users_by_status(self, statut):
+        conn = get_connection()
+        df = pd.read_sql("SELECT * FROM utilisateurs WHERE statut = ?", conn, params=(statut,))
+        conn.close()
+        return df
+
+    def approve_user(self, username):
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("UPDATE utilisateurs SET statut = 'Actif' WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+
+    def reject_user(self, username):
+        """Supprime la demande refusée."""
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM utilisateurs WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+
+    def verify_user(self, username, password):
+        """Vérifie les identifiants en base de données."""
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT nom, role, statut FROM utilisateurs WHERE username = ? AND password = ?",
+                  (username, password))
+        user = c.fetchone()
+        conn.close()
+        return user
+
+    def reset_user_password(self, email):
+        """Génère un nouveau mot de passe aléatoire si l'e-mail existe."""
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT username, nom FROM utilisateurs WHERE email = ?", (email,))
+        user = c.fetchone()
+
+        if user:
+            # Génération d'un mot de passe de 8 caractères (lettres + chiffres)
+            new_pwd = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+            c.execute("UPDATE utilisateurs SET password = ? WHERE email = ?", (new_pwd, email))
+            conn.commit()
+            conn.close()
+            return True, user[0], user[1], new_pwd
+
+        conn.close()
+        return False, None, None, None
+
+    # --- MÉTHODES LIVRAISONS ---
+    def create_demande(self, id_req, fourn, cat, pal, colis, date, heure, email, tel, transporteur, chauffeur, immat,
+                       comm):
         conn = get_connection()
         c = conn.cursor()
         c.execute('''
@@ -77,21 +172,20 @@ class SupplyChainDB:
                 statut, quai, message_sc, est_modifie
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (id_req, fourn, cat, pal, colis, date, heure, email, tel, transporteur, chauffeur, immat, comm, "En attente", "Non assigné", "", 0))
+        ''', (id_req, fourn, cat, pal, colis, date, heure, email, tel, transporteur, chauffeur, immat, comm,
+              "En attente", "Non assigné", "", 0))
         conn.commit()
         conn.close()
 
     def update_statut(self, id_req, statut, quai=None, msg="", nouvelle_heure=None, est_modifie=False):
         conn = get_connection()
         c = conn.cursor()
-
         query = "UPDATE livraisons SET statut = ?, message_sc = ?, est_modifie = ?"
         params = [statut, msg, est_modifie]
 
         if quai:
             query += ", quai = ?"
             params.append(quai)
-
         if nouvelle_heure:
             query += ", heure_prevue = ?"
             params.append(nouvelle_heure)
@@ -104,30 +198,22 @@ class SupplyChainDB:
         conn.close()
 
     def check_conflit(self, date_str, heure_str, quai):
-        """Vérifie si le quai est libre (Tolérance +/- 30 min)"""
         df = self.get_all()
         if df.empty: return False
-
-        # On ne garde que les validés sur ce quai ce jour-là
         target_date = pd.to_datetime(date_str).date()
         conflits = df[
             (df['statut'] == 'Validé') &
             (df['quai'] == quai) &
             (df['date_prevue'].dt.date == target_date)
             ]
-
         if conflits.empty: return False
-
-        # Vérification fine de l'heure
         heure_exacte = conflits[conflits['heure_prevue'] == str(heure_str)[:5]]
-
         return not heure_exacte.empty
 
     def get_all(self):
         conn = get_connection()
         try:
             df = pd.read_sql("SELECT * FROM livraisons", conn)
-            # Conversion forcée des types pour éviter les bugs Streamlit
             if not df.empty:
                 df['date_prevue'] = pd.to_datetime(df['date_prevue'])
                 df['est_modifie'] = df['est_modifie'].astype(bool)
