@@ -3,13 +3,11 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime, time, timedelta
 import uuid
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 # --- IMPORTATIONS LOCALES ---
 from database import SupplyChainDB
 from auth import check_password
+from utils import send_email, ADMIN_EMAIL
 
 # =====================================================================
 # 1. CONFIGURATION DE L'APPLICATION
@@ -23,7 +21,7 @@ st.set_page_config(
 
 # Constantes Globales
 LISTE_QUAIS = ["Q4", "Q5", "Q6", "Q7"]
-TEMPS_DECHARGEMENT_MIN = 45
+MINUTES_PAR_PALETTE = 2  # Le temps dynamique remplace l'ancien forfait de 45 min
 
 # =====================================================================
 # 2. CSS "MIDNIGHT OPS V25 - LOGIWAVE"
@@ -127,13 +125,16 @@ CSS_STYLE = """
 
     .js-plotly-plot .plotly .modebar { opacity: 0.2 !important; } 
     .js-plotly-plot .plotly .modebar:hover { opacity: 1 !important; }
+
+    /* CORRECTION COULEUR LÉGENDE GANTT (Texte catégorie) */
+    .js-plotly-plot .plotly .legend text { fill: white !important; color: white !important; }
     </style>
 """
 st.markdown(CSS_STYLE, unsafe_allow_html=True)
 
 
 # =====================================================================
-# 3. INITIALISATION ET MOTEUR E-MAIL
+# 3. INITIALISATION
 # =====================================================================
 @st.cache_resource
 def get_db():
@@ -148,40 +149,18 @@ if role is None:
                 unsafe_allow_html=True)
     st.stop()
 
-# --- CONFIGURATION E-MAIL ---
-ADMIN_EMAIL = "adnane.fm@gmail.com"
-SENDER_EMAIL = "adnane.fm@gmail.com"
-SENDER_PASSWORD = "brpjihlavmcuvgqq"  # Sans les espaces !
-
-
-def send_email(to_email, subject, html_content):
-    """Moteur d'envoi d'e-mail via SMTP."""
-    try:
-        msg = MIMEMultipart("alternative")
-        msg['Subject'] = subject
-        msg['From'] = f"Logiwave YMS <{SENDER_EMAIL}>"
-        msg['To'] = to_email
-        msg.attach(MIMEText(html_content, 'html'))
-
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, to_email, msg.as_string())
-        server.quit()
-        return True
-    except Exception as e:
-        st.error(f"Erreur d'envoi e-mail : {e}")
-        return False
-
 
 # =====================================================================
 # 4. FONCTIONS UTILITAIRES (HELPERS)
 # =====================================================================
-def get_time_window(heure_str):
+def get_time_window(heure_str, palettes):
+    """Calcule la fenêtre de temps dynamiquement selon le nombre de palettes."""
     h_str = str(heure_str)[:5]
     try:
         start_dt = datetime.strptime(h_str, "%H:%M")
-        end_dt = start_dt + timedelta(minutes=TEMPS_DECHARGEMENT_MIN)
+        # Calcul : 2 minutes par palette
+        duree = max(10, int(palettes) * MINUTES_PAR_PALETTE)  # Sécurité : au moins 10 min
+        end_dt = start_dt + timedelta(minutes=duree)
         return h_str, end_dt.strftime("%H:%M"), start_dt, end_dt
     except:
         return h_str, h_str, datetime.now(), datetime.now()
@@ -196,7 +175,8 @@ def parse_date(date_val, format_fr=False):
         return str(date_val).split(" ")[0]
 
 
-def get_next_available_time(df, target_date, quai, proposed_start_time):
+def get_next_available_time(df, target_date, quai, proposed_start_time, proposed_palettes):
+    """Vérifie les conflits en tenant compte du temps dynamique de chaque livraison."""
     df_valid = df[(df['statut'] == 'Validé') & (df['quai'] == quai)].copy()
     if df_valid.empty: return None
 
@@ -206,12 +186,14 @@ def get_next_available_time(df, target_date, quai, proposed_start_time):
 
     intervals = []
     proposed_start_dt = datetime.combine(target_date, proposed_start_time)
-    proposed_end_dt = proposed_start_dt + timedelta(minutes=TEMPS_DECHARGEMENT_MIN)
+    duree_proposee = max(10, int(proposed_palettes) * MINUTES_PAR_PALETTE)
+    proposed_end_dt = proposed_start_dt + timedelta(minutes=duree_proposee)
 
     for r in df_day.to_dict('records'):
-        _, _, s_t, e_t = get_time_window(r['heure_prevue'])
+        _, _, s_t, e_t = get_time_window(r['heure_prevue'], r.get('palettes', 0))
         s_dt = datetime.combine(target_date, s_t.time())
-        intervals.append((s_dt, s_dt + timedelta(minutes=TEMPS_DECHARGEMENT_MIN)))
+        e_dt = s_dt + timedelta(minutes=max(10, int(r.get('palettes', 0)) * MINUTES_PAR_PALETTE))
+        intervals.append((s_dt, e_dt))
 
     intervals.sort(key=lambda x: x[0])
 
@@ -225,7 +207,7 @@ def get_next_available_time(df, target_date, quai, proposed_start_time):
 
     candidate_time = proposed_start_dt
     for s, e in intervals:
-        candidate_end = candidate_time + timedelta(minutes=TEMPS_DECHARGEMENT_MIN)
+        candidate_end = candidate_time + timedelta(minutes=duree_proposee)
         if candidate_time < e and candidate_end > s:
             candidate_time = e
 
@@ -244,7 +226,7 @@ def supplier_card_html(row):
     }
     s = config.get(row['statut'], config["En attente"])
     date_str = parse_date(row['date_prevue'])
-    h_start, h_end, _, _ = get_time_window(row['heure_prevue'])
+    h_start, h_end, _, _ = get_time_window(row['heure_prevue'], row.get('palettes', 0))
     time_display = f"{h_start} - {h_end}"
     is_modified = row.get('est_modifie', False) in [1, True, "1", "true", "True"]
 
@@ -282,7 +264,7 @@ def supplier_card_html(row):
 
 
 # =====================================================================
-# 5. VUE FOURNISSEUR (PORTAIL PARTENAIRE)
+# 5. VUE FOURNISSEUR
 # =====================================================================
 if role == "FOURNISSEUR":
     st.markdown(
@@ -310,7 +292,7 @@ if role == "FOURNISSEUR":
             st.markdown("#### Détails du Transport")
             c4, c5 = st.columns(2)
             transporteur = c4.text_input("Transporteur (ex: STEF, XPO...)")
-            email_f = c5.text_input("E-mail de l'utilisateur", "logistics@supplier.com")
+            email_f = c5.text_input("E-mail de l'utilisateur", "")
 
             c6, c7, c8 = st.columns(3)
             nom_chauffeur = c6.text_input("Nom du chauffeur")
@@ -323,36 +305,35 @@ if role == "FOURNISSEUR":
             colis = c10.number_input("Colis", min_value=0, value=0)
 
             commentaire = st.text_area("Commentaire (optionnel)", placeholder="Instructions spécifiques...")
-            st.info("⏱️ Note : Le temps de déchargement au quai est fixé à un forfait de 45 minutes.")
+            st.info(
+                f"⏱️ Note : Le temps de déchargement au quai est calculé sur la base de {MINUTES_PAR_PALETTE} minutes par palette.")
 
             if st.form_submit_button("Transmettre la demande", type="primary", use_container_width=True):
                 if not familles_selectionnees:
                     st.error("Veuillez sélectionner au moins une famille de produits.")
+                elif not email_f:
+                    st.error("Veuillez renseigner votre adresse e-mail pour recevoir la confirmation.")
                 else:
                     new_id = f"REQ-{str(uuid.uuid4())[:5].upper()}"
                     nom = st.session_state.username.capitalize()
                     db.create_demande(new_id, nom, cat, pal, colis, date_f, str(heure_f)[:5], email_f, tel_f,
                                       transporteur, nom_chauffeur, immatriculation, commentaire)
 
-                    # --- ENVOI E-MAIL À L'ADMIN ---
                     html_admin = f"""
                     <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px;">
                         <h2 style="color: #3b82f6; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">Nouvelle Demande YMS</h2>
                         <p>Bonjour l'équipe Hub,</p>
-                        <p>Le partenaire <strong>{nom}</strong> vient de soumettre une nouvelle demande de livraison sur Logiwave :</p>
+                        <p>Le partenaire <strong>{nom}</strong> vient de soumettre une nouvelle demande de livraison :</p>
                         <ul style="background-color: #f8fafc; padding: 15px 30px; border-radius: 6px; list-style-type: square;">
                             <li style="margin-bottom: 5px;"><strong>Date & Heure :</strong> {date_f.strftime('%d/%m/%Y')} à {str(heure_f)[:5]}</li>
                             <li style="margin-bottom: 5px;"><strong>Familles :</strong> {cat}</li>
                             <li style="margin-bottom: 5px;"><strong>Volumes :</strong> {pal} Palettes, {colis} Colis</li>
                             <li style="margin-bottom: 5px;"><strong>Transporteur :</strong> {transporteur}</li>
-                            <li style="margin-bottom: 5px;"><strong>E-mail :</strong> {email_f}</li>
-                            <li><strong>Téléphone :</strong> {tel_f}</li>
                         </ul>
                         <p>Veuillez vous connecter pour valider et assigner un quai.</p>
                     </div>
                     """
                     send_email(ADMIN_EMAIL, f"[Logiwave] Nouvelle demande - {nom}", html_admin)
-
                     st.success("Demande transmise au hub logistique avec succès !")
                     st.rerun()
 
@@ -365,7 +346,7 @@ if role == "FOURNISSEUR":
             st.markdown(supplier_card_html(row), unsafe_allow_html=True)
 
 # =====================================================================
-# 6. VUE ADMIN (HUB LOGISTIQUE)
+# 6. VUE ADMIN
 # =====================================================================
 elif role == "ADMIN":
     st.markdown(
@@ -378,7 +359,7 @@ elif role == "ADMIN":
         st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
-    tabs = st.tabs(["📥 Boîte de réception", "🏢 Gestion des Quais", "📅 Planning Gantt"])
+    tabs = st.tabs(["📥 Boîte de réception", "🏢 Gestion des Quais", "📅 Planning Gantt", "👥 Utilisateurs"])
     df = db.get_all()
 
     # --- TAB 1: INBOX ---
@@ -391,7 +372,7 @@ elif role == "ADMIN":
         else:
             for row in to_do_df.to_dict('records'):
                 date_inbox = parse_date(row['date_prevue'], format_fr=True)
-                h_start, h_end, start_t_inbox, _ = get_time_window(row['heure_prevue'])
+                h_start, h_end, start_t_inbox, _ = get_time_window(row['heure_prevue'], row.get('palettes', 0))
                 time_display_inbox = f"{h_start} à {h_end}"
                 transp_name = f" • {row['transporteur']}" if pd.notna(row.get('transporteur')) and row[
                     'transporteur'] else ""
@@ -411,20 +392,18 @@ elif role == "ADMIN":
 
                     st.markdown("---")
                     msg_placeholder = st.empty()
-
                     c1, c2 = st.columns(2)
                     quai = c1.selectbox("Assigner un Quai", LISTE_QUAIS, key=f"q_{row['id']}")
                     h_edit = c2.time_input("Heure d'arrivée", value=start_t_inbox.time(), step=timedelta(minutes=15),
                                            key=f"h_{row['id']}")
-
                     b1, b2, b3 = st.columns([1, 1, 2])
 
                     if b1.button("✅ Valider l'accès", key=f"v_{row['id']}", type="primary", use_container_width=True):
                         target_date = pd.to_datetime(row['date_prevue']).date() if pd.notna(
                             row['date_prevue']) else None
-
                         if target_date:
-                            next_avail_dt = get_next_available_time(df, target_date, quai, h_edit)
+                            next_avail_dt = get_next_available_time(df, target_date, quai, h_edit,
+                                                                    row.get('palettes', 0))
                             if next_avail_dt:
                                 msg_placeholder.markdown(f"""
                                 <div style="background-color: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.5); border-radius: 6px; padding: 12px; margin-bottom: 15px; display: flex; align-items: start; gap: 10px;">
@@ -440,17 +419,17 @@ elif role == "ADMIN":
                                 db.update_statut(row['id'], "Validé", quai, nouvelle_heure=str(h_edit)[:5],
                                                  est_modifie=is_mod)
 
-                                # --- ENVOI E-MAIL AU FOURNISSEUR ---
-                                supplier_email = row.get('email', 'logistics@supplier.com')
+                                supplier_email = row.get('email', '')
                                 h_deb = str(h_edit)[:5]
-                                h_fin = (datetime.strptime(h_deb, "%H:%M") + timedelta(
-                                    minutes=TEMPS_DECHARGEMENT_MIN)).strftime("%H:%M")
+
+                                duree_calcul = max(10, int(row.get('palettes', 0)) * MINUTES_PAR_PALETTE)
+                                h_fin = (datetime.strptime(h_deb, "%H:%M") + timedelta(minutes=duree_calcul)).strftime(
+                                    "%H:%M")
 
                                 html_supplier = f"""
-                                <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 600px;">
+                                <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px;">
                                     <div style="border-bottom: 3px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px;">
                                         <h2 style="color: #1e293b; margin:0;">Confirmation de Livraison</h2>
-                                        <span style="color: #64748b; font-size: 14px;">Réf : {row['id']}</span>
                                     </div>
                                     <p>Bonjour l'équipe <strong>{row['fournisseur']}</strong>,</p>
                                     <p>Nous vous confirmons la validation de votre créneau de livraison sur notre Hub Logistique Logiwave.</p>
@@ -462,12 +441,60 @@ elif role == "ADMIN":
                                             <li>📍 <strong>Quai assigné :</strong> <span style="font-size:16px; font-weight:bold; color:#10b981;">{quai}</span></li>
                                         </ul>
                                     </div>
-                                    <p style="margin-top: 30px; font-size: 11px; color: #94a3b8;">Ce message est généré automatiquement, merci de ne pas y répondre.</p>
+
+                                    <div style="margin-top: 30px;">
+                                        <p style="color: #ef4444; font-weight: bold; font-size: 15px;">Afin de garantir votre sécurité et le bon fonctionnement de nos opérations, merci de prendre connaissance et de respecter les règles suivantes :</p>
+
+                                        <h4 style="color: #3b82f6; margin-bottom: 5px; margin-top: 15px;">🛠️ Equipement obligatoire :</h4>
+                                        <ul style="margin-top: 5px;">
+                                            <li>Port de chaussures de sécurité et gilet jaune fluorescent.</li>
+                                        </ul>
+
+                                        <h4 style="color: #3b82f6; margin-bottom: 5px; margin-top: 15px;">🚦 Sécurité routière sur site :</h4>
+                                        <ul style="margin-top: 5px;">
+                                            <li>Respect strict de la vitesse maximale de <strong>20 km/h</strong>.</li>
+                                            <li>Respect du sens de circulation.</li>
+                                            <li>Attention à la circulation des véhicules légers (VL) et des piétons.</li>
+                                        </ul>
+
+                                        <h4 style="color: #3b82f6; margin-bottom: 5px; margin-top: 15px;">🛂 Contrôle à la sortie :</h4>
+                                        <ul style="margin-top: 5px;">
+                                            <li>Couper le moteur et activer le frein de parc.</li>
+                                            <li>Descendre de la cabine et accompagner le gardien pour le contrôle de la remorque ainsi que des documents.</li>
+                                        </ul>
+
+                                        <h4 style="color: #3b82f6; margin-bottom: 5px; margin-top: 15px;">🍏 Zone sous réglementation alimentaire :</h4>
+                                        <ul style="margin-top: 5px;">
+                                            <li>Interdiction de manger ou de fumer dans l’entrepôt.</li>
+                                            <li>Interdiction d’introduire des boissons alcoolisées sur le site.</li>
+                                            <li>Interdiction de filmer ou de prendre des photos.</li>
+                                            <li>Interdiction d’effectuer des transactions commerciales sur site.</li>
+                                        </ul>
+                                    </div>
+
+                                    <div style="background-color: #fee2e2; padding: 15px; border-radius: 4px; border-left: 4px solid #ef4444; margin-top: 25px;">
+                                        <p style="margin: 0; font-size: 13px; color: #991b1b;">
+                                            <strong>⚠️ Attention :</strong> Le respect de ces règles est obligatoire pour accéder au site. Tout manquement pourra entraîner un refus d’accès ou des sanctions conformément à notre règlement interne.
+                                        </p>
+                                    </div>
+
+                                    <p style="margin-top: 25px; font-weight: bold;">Nous vous remercions de votre coopération et vous souhaitons une visite sécurisée et efficace.</p>
                                 </div>
                                 """
-                                send_email(supplier_email, f"[Logiwave] Confirmation Livraison - {date_inbox}",
-                                           html_supplier)
 
+                                st.toast(f"Tentative d'envoi à : {supplier_email}", icon="⏳")
+                                envoi_ok = send_email(supplier_email,
+                                                      f"[Logiwave] Confirmation Livraison - {date_inbox}",
+                                                      html_supplier)
+
+                                if envoi_ok:
+                                    st.success(f"E-mail de confirmation bien envoyé à {supplier_email}")
+                                else:
+                                    st.error(f"L'envoi a échoué. L'adresse {supplier_email} est peut-être invalide.")
+
+                                import time
+
+                                time.sleep(1.5)
                                 st.rerun()
 
                     if b2.button("❌ Refuser", key=f"r_{row['id']}", type="secondary", use_container_width=True):
@@ -476,66 +503,48 @@ elif role == "ADMIN":
 
     # --- TAB 2: GESTION DES QUAIS ---
     with tabs[1]:
-        st.markdown("#### 🏢 Opérations Quotidiennes (Vue par Quai)")
-        date_gestion = st.date_input("Sélectionner la date d'opération", datetime.now(), key="date_gestion")
+        st.markdown("#### 🏢 Opérations Quotidiennes")
+        date_gestion = st.date_input("Sélectionner la date", datetime.now(), key="date_gestion")
 
         if df.empty:
-            st.info("La base de données est vide.")
+            st.info("Base de données vide.")
         else:
             df_date = df[(df['statut'] == 'Validé') & (
                         pd.to_datetime(df['date_prevue']).dt.date == pd.to_datetime(date_gestion).date())]
-
             cols = st.columns(4)
             for i, quai in enumerate(LISTE_QUAIS):
                 with cols[i]:
-                    st.markdown(f"""
-                    <div style="background-color: #1e293b; padding: 12px; border-radius: 8px; text-align: center; border-bottom: 4px solid var(--c-blue); margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-                        <h3 style="margin: 0; color: white; font-size: 20px; font-weight: 800; letter-spacing: 1px;">{quai}</h3>
-                    </div>
-                    """, unsafe_allow_html=True)
-
+                    st.markdown(
+                        f"<div style='background-color:#1e293b; padding:12px; border-radius:8px; text-align:center; border-bottom:4px solid var(--c-blue); margin-bottom:15px;'><h3 style='margin:0; color:white;'>{quai}</h3></div>",
+                        unsafe_allow_html=True)
                     df_quai = df_date[df_date['quai'] == quai]
 
                     if df_quai.empty:
-                        st.markdown("""
-                        <div style='text-align:center; padding: 20px; background: rgba(255,255,255,0.02); border: 1px dashed #374151; border-radius: 8px;'>
-                            <span class='material-symbols-outlined' style='color:#475569; font-size: 30px;'>deck</span><br>
-                            <span style='color:#64748b; font-size:14px; font-weight: 500;'>Quai Libre</span>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.markdown(
+                            "<div style='text-align:center; padding:20px; border:1px dashed #374151; border-radius:8px;'><span style='color:#64748b;'>Quai Libre</span></div>",
+                            unsafe_allow_html=True)
                     else:
                         for row in df_quai.sort_values(by='heure_prevue').to_dict('records'):
-                            h_start, h_end, _, _ = get_time_window(row['heure_prevue'])
-
+                            h_start, h_end, _, _ = get_time_window(row['heure_prevue'], row.get('palettes', 0))
                             st.markdown(f"""
-                            <div class="status-card" style="padding: 12px; border-left: 4px solid var(--c-blue); margin-bottom: 10px;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                                    <div style="color:var(--c-blue); font-weight:700; font-size:14px; display:flex; align-items:center; gap:5px; background: rgba(59, 130, 246, 0.1); padding: 3px 8px; border-radius: 4px;">
-                                        <span class="material-symbols-outlined" style="font-size:16px;">schedule</span> {h_start} - {h_end}
-                                    </div>
-                                </div>
-                                <div style="color:white; font-weight:800; font-size:15px; margin-bottom: 8px; letter-spacing: 0.5px;">{row['fournisseur']}</div>
+                            <div class="status-card" style="padding:12px; border-left:4px solid var(--c-blue); margin-bottom:10px;">
+                                <div style="color:var(--c-blue); font-weight:700; margin-bottom:6px;">{h_start} - {h_end}</div>
+                                <div style="color:white; font-weight:800; font-size:15px;">{row['fournisseur']}</div>
                                 <div style="color:#cbd5e1; font-size:12px; display:flex; flex-direction:column; gap:4px; font-weight: 500;">
-                                    <span style="display:flex; align-items:center; gap:6px; color:#60a5fa;"><span class="material-symbols-outlined" style="font-size:14px;">category</span> {row['categorie']}</span>
-                                    <span style="display:flex; align-items:center; gap:6px;"><span class="material-symbols-outlined" style="font-size:14px; color:#94a3b8;">inventory_2</span> {row['palettes']} Pal. | {row['colis']} Colis</span>
-                                    <span style="display:flex; align-items:center; gap:6px;"><span class="material-symbols-outlined" style="font-size:14px; color:#94a3b8;">local_shipping</span> {row['transporteur'] if pd.notna(row['transporteur']) and row['transporteur'] else 'N/A'}</span>
-                                    <span style="display:flex; align-items:center; gap:6px;"><span class="material-symbols-outlined" style="font-size:14px; color:#94a3b8;">pin</span> {row['immatriculation'] if pd.notna(row['immatriculation']) and row['immatriculation'] else 'N/A'}</span>
+                                    <span>📦 {row['palettes']} Pal. | {row['colis']} Colis</span>
                                 </div>
                             </div>
                             """, unsafe_allow_html=True)
 
-    # --- TAB 3: PLANNING GANTT ---
+    # --- TAB 3: GANTT ---
     with tabs[2]:
         st.markdown("#### 📅 Séquencement Temporel (Gantt)")
         c_filt1, c_filt2 = st.columns([1, 3])
         gantt_date = c_filt1.date_input("Sélectionner la date", datetime.now(), key="gantt_date_gantt")
 
-        if df.empty:
-            st.info("La base de données est vide.")
-        else:
+        if not df.empty:
             options_filtre_quai = ["Tout"] + LISTE_QUAIS
-            quais_selected = c_filt2.multiselect("Filtrer par Quai", options_filtre_quai, default=["Tout"],
-                                                 key="gantt_quai_filter")
+            quais_selected = c_filt2.multiselect("Filtrer par Quai", options_filtre_quai, default=["Tout"])
 
             gantt_df = df[(df['statut'] == 'Validé') & (
                         pd.to_datetime(df['date_prevue']).dt.date == pd.to_datetime(gantt_date).date())].copy()
@@ -551,31 +560,83 @@ elif role == "ADMIN":
                     gantt_df['start'] = pd.to_datetime(
                         gantt_df['date_prevue'].astype(str).str[:10] + ' ' + gantt_df['heure_prevue'].astype(str).str[
                                                                              :5])
-                    gantt_df['end'] = gantt_df['start'] + pd.to_timedelta(TEMPS_DECHARGEMENT_MIN, unit='m')
+                    gantt_df['duree_min'] = gantt_df['palettes'].fillna(0).astype(int) * MINUTES_PAR_PALETTE
+                    gantt_df['end'] = gantt_df['start'] + pd.to_timedelta(gantt_df['duree_min'], unit='m')
 
-                    fig = px.timeline(
-                        gantt_df, x_start="start", x_end="end", y="quai", color="categorie", text="fournisseur",
-                        template="plotly_dark", height=450
-                    )
-
+                    fig = px.timeline(gantt_df, x_start="start", x_end="end", y="quai", color="categorie",
+                                      text="fournisseur", template="plotly_dark", height=450)
                     fig.update_layout(
-                        xaxis_title=None, yaxis_title=None, plot_bgcolor='#151922', paper_bgcolor='#151922',
-                        font=dict(family="Inter", size=13, color="#e2e8f0"), margin=dict(t=40, b=40, l=10, r=10),
-                        bargap=0.3,
-                        legend=dict(title=dict(text="Combinaisons", font=dict(size=14, color="white")), orientation="v",
-                                    y=0.5, x=1.02, font=dict(color="white", size=12), bgcolor="rgba(0,0,0,0)"),
+                        plot_bgcolor='#151922', paper_bgcolor='#151922',
+                        font=dict(family="Inter", size=13, color="#e2e8f0"),
+                        margin=dict(t=40, b=40, l=10, r=10), bargap=0.3,
                         xaxis=dict(tickformat="%H:%M", side="bottom", gridcolor="#262a36", showgrid=True, dtick=3600000,
                                    range=[datetime.combine(gantt_date, time(6, 0)),
                                           datetime.combine(gantt_date, time(22, 0))]),
                         yaxis=dict(categoryarray=y_axis_order, categoryorder="array", showgrid=True,
                                    gridcolor="#262a36", tickfont=dict(color="white", size=13))
                     )
-                    fig.update_traces(marker_line_color='#151922', marker_line_width=2, opacity=0.95,
-                                      textposition="inside", insidetextanchor="middle",
-                                      textfont=dict(color="white", size=12, weight="bold"))
-
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.warning("Aucune livraison pour les quais sélectionnés.")
             else:
                 st.info(f"Aucune livraison planifiée le {gantt_date.strftime('%d/%m/%Y')}.")
+
+    # --- TAB 4: UTILISATEURS ---
+    with tabs[3]:
+        st.markdown("#### 🤝 Demandes de création de compte")
+        df_users = db.get_users_by_status("En attente")
+
+        if df_users.empty:
+            st.info("Aucune demande en attente.")
+        else:
+            for row in df_users.to_dict('records'):
+                with st.container():
+                    st.markdown(f"""
+                    <div style="background-color: var(--card-bg); padding: 15px; border-radius: 8px; border: 1px solid var(--border-color); margin-bottom: 10px;">
+                        <h4 style="margin: 0; color: white;">{row['nom']}</h4>
+                        <p style="margin: 5px 0; color: #cbd5e1;">📧 {row['email']}<br>🆔 Identifiant : <b style="color:white;">{row['username']}</b></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    c_app, c_ref = st.columns(2)
+
+                    # BOUTON APPROUVER
+                    if c_app.button(f"✅ Approuver", key=f"app_{row['username']}", type="primary",
+                                    use_container_width=True):
+                        db.approve_user(row['username'])
+
+                        html_welcome = f"""
+                        <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px;">
+                            <h2 style="color: #10b981;">Compte activé !</h2>
+                            <p>Bonjour l'équipe <strong>{row['nom']}</strong>,</p>
+                            <p>Votre compte partenaire a été validé par le Hub Logistique.</p>
+                            <p>Vous pouvez vous connecter dès maintenant sur Logiwave avec :</p>
+                            <ul style="background-color: #f8fafc; padding: 15px 30px; border-radius: 6px; list-style-type: square;">
+                                <li><b>Identifiant :</b> {row['username']}</li>
+                                <li><b>Mot de passe :</b> <i>Celui que vous avez choisi lors de l'inscription</i></li>
+                            </ul>
+                            <p>À très vite sur le portail !</p>
+                        </div>
+                        """
+                        send_email(row['email'], "[Logiwave] Votre compte est actif", html_welcome)
+
+                        st.success(f"Compte activé pour {row['nom']}.")
+                        st.rerun()
+
+                    # BOUTON REFUSER
+                    if c_ref.button(f"❌ Refuser", key=f"ref_{row['username']}", type="secondary",
+                                    use_container_width=True):
+                        db.reject_user(row['username'])
+
+                        html_reject = f"""
+                        <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px;">
+                            <h2 style="color: #ef4444;">Demande refusée</h2>
+                            <p>Bonjour,</p>
+                            <p>Nous vous informons que votre demande de création de compte sur Logiwave n'a pas pu être validée par le Hub Logistique.</p>
+                            <p>Si vous pensez qu'il s'agit d'une erreur, merci de vous rapprocher de votre contact habituel au sein du Hub.</p>
+                        </div>
+                        """
+                        send_email(row['email'], "[Logiwave] Mise à jour de votre demande", html_reject)
+
+                        st.warning(f"La demande de {row['nom']} a été refusée et supprimée.")
+                        st.rerun()
